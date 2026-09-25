@@ -3,8 +3,10 @@
 # and be able to retrieve results later:
 
 import os
+import json
 import pickle
 import threading
+import traceback
 import pandas as pd
 from io import BytesIO
 
@@ -111,6 +113,7 @@ os.makedirs(JOB_DIR, exist_ok=True)
 
 SOLVE_STATUS_PATH = os.path.join(JOB_DIR, "solve.status")
 SOLVE_RESULT_PATH = os.path.join(JOB_DIR, "solve.result")
+UNAVAILABILITY_PATH = os.path.join(JOB_DIR, "unavailability.json")
 
 _solve_lock = threading.Lock()
 
@@ -134,7 +137,7 @@ def start_solve_job(job_fn, *args, **kwargs):
                     f.write("done")
         except Exception as e:
             with open(SOLVE_RESULT_PATH, "wb") as f:
-                pickle.dump({"status": "ERROR", "errors": [str(e)]}, f)
+                pickle.dump({"status": "ERROR", "errors": [str(e)], "traceback": traceback.format_exc()}, f)
             with _solve_lock:
                 with open(SOLVE_STATUS_PATH, "w") as f:
                     f.write("error")
@@ -157,3 +160,64 @@ def get_solve_result():
         return None
     with open(SOLVE_RESULT_PATH, "rb") as f:
         return pickle.load(f)
+
+
+# --------------------------------------------------------------------
+# Unavailability persistence
+# --------------------------------------------------------------------
+    # Unavailability is stored per worker as:
+    #   {"days": {1,2,...}, "ranges": {1: [(start_slot, end_slot), ...], 2: [...], ...}}
+    # where day 1..7 = Monday..Sunday, and (start_slot, end_slot) is an INCLUSIVE
+    # range of hourly slot indices (1..18) the worker is unavailable for on that weekday.
+    # "ranges" is what the UI edits directly; "slots" (the flat (day, slot) set the
+    # optimizer actually consumes) is derived from it with ranges_to_slots() below.
+    # Saved to disk so it survives closing/reopening the app, until edited again.
+
+def ranges_to_slots(ranges):
+    """Expand {day: [(s, e), ...]} into a flat set of (day, slot) tuples (inclusive)."""
+    slots = set()
+    for d, rs in (ranges or {}).items():
+        d = int(d)
+        for (s, e) in rs:
+            s, e = int(s), int(e)
+            if e < s:
+                s, e = e, s
+            slots.update((d, t) for t in range(s, e + 1))
+    return slots
+
+
+def save_unavailability(unavailability):
+    """Persist the unavailability dict (per-worker days/ranges) to disk as JSON."""
+    serializable = {}
+    for w, u in (unavailability or {}).items():
+        days = sorted(int(d) for d in u.get("days", set()))
+        ranges = {
+            str(int(d)): [[int(s), int(e)] for (s, e) in rs]
+            for d, rs in (u.get("ranges", {}) or {}).items()
+            if rs  # skip empty day entries
+        }
+        serializable[w] = {"days": days, "ranges": ranges}
+
+    with open(UNAVAILABILITY_PATH, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, ensure_ascii=False, indent=2)
+
+
+def load_unavailability():
+    """Load the unavailability dict from disk; returns {} if nothing saved yet."""
+    if not os.path.exists(UNAVAILABILITY_PATH):
+        return {}
+    try:
+        with open(UNAVAILABILITY_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    unavailability = {}
+    for w, u in raw.items():
+        days = set(int(d) for d in u.get("days", []))
+        ranges = {
+            int(d): [tuple(pair) for pair in rs]
+            for d, rs in u.get("ranges", {}).items()
+        }
+        unavailability[w] = {"days": days, "ranges": ranges}
+    return unavailability
