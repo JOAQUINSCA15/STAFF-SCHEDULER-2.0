@@ -7,7 +7,8 @@ import streamlit as st
 import copy
 from utils import (
     read_table_file_demand, read_table_file_staff, build_shift_set_fallback,
-    create_excel_download, start_solve_job, get_solve_status, get_solve_result
+    create_excel_download, start_solve_job, get_solve_status, get_solve_result,
+    save_unavailability, load_unavailability, ranges_to_slots
 )
 from collections import defaultdict
 
@@ -23,6 +24,10 @@ except Exception:
     st.error("Missing numpy")
     st.stop()
 
+
+# ------------------ Horizon ------------------
+WEEK_OPTIONS = [2, 3, 4]      # choices offered in the UI dropdown
+DEFAULT_NUM_WEEKS = 3          # default selection
 
 # ------------------ Defaults ------------------
 DEFAULT_STAFF = [
@@ -114,10 +119,11 @@ time_map_hour = {
 SLOT_LABELS = ["08-09","09-10","10-11","11-12","12-13","13-14","14-15","15-16","16-17",
                "17-18","18-19","19-20","20-21","21-22","22-23","23-00","00-01","01-02"]
 DAY_LABELS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-DAY_LABELS_FULL = ["Mon (1)","Tue (1)","Wed (1)","Thu (1)","Fri (1)","Sat (1)","Sun (1)", 
-                   "Mon (2)","Tue (2)","Wed (2)","Thu (2)","Fri (2)","Sat (2)","Sun (2)", 
-                   "Mon (3)","Tue (3)","Wed (3)","Thu (3)","Fri (3)","Sat (3)","Sun (3)", 
-                   "Mon (4)","Tue (4)","Wed (4)","Thu (4)","Fri (4)","Sat (4)","Sun (4)"]
+
+def day_labels_full(num_weeks):
+    """Build 'Mon (1)'...'Sun (N)' labels for a given number of weeks."""
+    return [f"{DAY_LABELS[d % 7]} ({d // 7 + 1})" for d in range(num_weeks * 7)]
+
 
 # ------------------ Optimizer import ------------------
 opt_mod = None
@@ -131,7 +137,9 @@ except Exception as e:
 
 # ------------------ Adapter ------------------
 def adapt_to_user_optimizer(demand_df, staff_df, max_dev, unavailability, priority_slots,
-                             M_choice, N_choice, constraints_flag):
+                             M_choice, N_choice, constraints_flag, num_weeks):
+
+    num_days = num_weeks * 7
 
     if opt_mod is None or not hasattr(opt_mod, "build_and_solve_shift_model"):
         return {
@@ -143,7 +151,7 @@ def adapt_to_user_optimizer(demand_df, staff_df, max_dev, unavailability, priori
     # Sets
     # --------------------------------------------------------------------
     W = list(staff_df["name"].astype(str))
-    D = list(range(1, 29)) # all days of 4 weeks
+    D = list(range(1, num_days + 1)) # all days across the scheduling horizon
     T = list(range(1, 19)) # 18 time slots
     S = build_shift_set_fallback(T)
     U = list(staff_df["location"].unique().astype(str)) 
@@ -171,9 +179,9 @@ def adapt_to_user_optimizer(demand_df, staff_df, max_dev, unavailability, priori
         for t_idx, t_raw in enumerate(df.index):
             t = t_idx + 1 # convert rows (time slots) to index (1, 2, ..., 18)
 
-            for week in range(4):
+            for week in range(num_weeks):
                 for d_idx, d_raw in enumerate(df.columns):
-                    d = week * 7 + d_idx + 1 # day index across 4 weeks
+                    d = week * 7 + d_idx + 1 # day index across the scheduling horizon
 
                     Demand[(u, d, t)] = float(df.loc[t_raw, d_raw]) # get ("CATEDRAL", 1, 1) format for ("CATEDRAL", "MONDAY", "10:00 - 11:00")
 
@@ -189,8 +197,8 @@ def adapt_to_user_optimizer(demand_df, staff_df, max_dev, unavailability, priori
 
     for u in U:
         total_demand = sum(Demand[(u, d, t)] for d in D for t in T)
-        # total_min_hr = staff_df.loc[staff_df["location"] == u, "min_week_hours"].sum() * 4
-        total_max_hr = staff_df.loc[staff_df["location"] == u, "max_week_hours"].sum() * 4
+        # total_min_hr = staff_df.loc[staff_df["location"] == u, "min_week_hours"].sum() * num_weeks
+        total_max_hr = staff_df.loc[staff_df["location"] == u, "max_week_hours"].sum() * num_weeks
 
         # if total_demand < total_min_hr:
         #     errors.append(
@@ -375,7 +383,23 @@ st.set_page_config(layout="wide")
 st.title("Shift Scheduler")
 
 with st.sidebar:
-    
+
+    # -------- Number of weeks to schedule --------
+    st.markdown("##### Number of Weeks")
+    if "num_weeks" not in st.session_state:
+        st.session_state["num_weeks"] = DEFAULT_NUM_WEEKS
+
+    num_weeks = st.selectbox(
+        label="Number of Weeks",
+        options=WEEK_OPTIONS,
+        index=WEEK_OPTIONS.index(st.session_state["num_weeks"]),
+        key="num_weeks_select",
+        label_visibility="collapsed",
+        help="How many weeks the schedule (and the demand template) should cover."
+    )
+    st.session_state["num_weeks"] = num_weeks
+    num_days = num_weeks * 7
+
     # Adjust Max Deviation
     st.markdown("##### Max Deviation")
     max_dev = st.number_input(
@@ -483,44 +507,114 @@ with st.sidebar:
 
     # -------- Unavailability --------
     st.subheader("Unavailability")
+
+    # Load once per session from disk, so previously-entered unavailability
+    # persists across app restarts until the user edits it again.
     if "unavailability" not in st.session_state:
-        st.session_state["unavailability"] = {}
+        st.session_state["unavailability"] = load_unavailability()
+
+    def _save_unavailability():
+        save_unavailability(st.session_state["unavailability"])
 
     st.markdown("##### Worker")
     if not staff_df.empty:
         w = st.selectbox(
-                    label="Worker", 
-                    options=staff_df["name"].astype(str).tolist(), 
-                    key="ua_worker_select", 
+                    label="Worker",
+                    options=staff_df["name"].astype(str).tolist(),
+                    key="ua_worker_select",
                     label_visibility="collapsed")
-        st.session_state["unavailability"].setdefault(w, {"days": set(), "slots": set()})
+        st.session_state["unavailability"].setdefault(w, {"days": set(), "ranges": {}})
         u = st.session_state["unavailability"][w]
+        u.setdefault("ranges", {})
 
-        st.markdown("##### Unavailable Days")
+        st.markdown("##### Unavailable Days (entire day off)")
         u_days = st.multiselect(
                     label="Unavailable Days",
                     options=list(range(1, 8)),
                     default=sorted(list(u["days"])),
                     format_func=lambda d: DAY_LABELS[d-1],
-                    key=f"ua_days_{w}", 
+                    key=f"ua_days_{w}",
                     label_visibility="collapsed"
                 )
-        u["days"] = set(u_days)
+        if set(u_days) != u["days"]:
+            u["days"] = set(u_days)
+            _save_unavailability()
 
-        st.markdown("##### Unavailable Time Slots")
+        st.markdown("##### Unavailable Time Ranges (partial day)")
+        st.caption("Pick a start–end range and click 'Add range'. You can add several ranges per day.")
+
         for d in range(1, 8):
-            with st.expander(DAY_LABELS[d-1]):
-                cur = sorted([t for (dd, t) in u["slots"] if dd == d])
-                sel = st.multiselect(
-                                    label="Unavailability Slots",
-                                    options=list(range(1, 16)),
-                                    default=cur,
-                                    format_func=lambda t: SLOT_LABELS[t-1],
-                                    key=f"ua_slots_{w}_{d}", 
-                                    label_visibility="collapsed"
-                                )
-                u["slots"] = {x for x in u["slots"] if x[0] != d}
-                u["slots"].update({(d, t) for t in sel})
+            with st.expander(DAY_LABELS[d - 1]):
+                day_ranges = u["ranges"].get(d, [])
+
+                # Existing ranges for this day, each removable
+                if day_ranges:
+                    for i, (s, e) in enumerate(sorted(day_ranges)):
+                        c1, c2 = st.columns([5, 1])
+                        c1.write(f"{SLOT_LABELS[s-1]} – {SLOT_LABELS[e-1]}")
+                        if c2.button("🗑", key=f"ua_del_{w}_{d}_{i}"):
+                            u["ranges"][d] = [r for r in day_ranges if r != (s, e)]
+                            if not u["ranges"][d]:
+                                del u["ranges"][d]
+                            _save_unavailability()
+                            st.rerun()
+                else:
+                    st.caption("No hay rangos guardados para este día.")
+
+                # Add a new range with a single two-handle slider (avoids the old
+                # multiselect bug where a second click could get dropped)
+                new_range = st.select_slider(
+                    label="New range",
+                    options=SLOT_LABELS,
+                    value=(SLOT_LABELS[0], SLOT_LABELS[-1]),
+                    key=f"ua_range_slider_{w}_{d}",
+                    label_visibility="collapsed"
+                )
+                if st.button("+ Add range", key=f"ua_add_{w}_{d}"):
+                    s_idx = SLOT_LABELS.index(new_range[0]) + 1
+                    e_idx = SLOT_LABELS.index(new_range[1]) + 1
+                    if s_idx > e_idx:
+                        s_idx, e_idx = e_idx, s_idx
+                    u["ranges"].setdefault(d, [])
+                    if (s_idx, e_idx) not in u["ranges"][d]:
+                        u["ranges"][d].append((s_idx, e_idx))
+                        _save_unavailability()
+                        st.rerun()
+
+        # -------- Copy a day's restrictions to another day --------
+        st.markdown("##### Copy restrictions between days")
+        cfrom, cto, cbtn = st.columns([2, 2, 1])
+        copy_from = cfrom.selectbox(
+            "From day", options=list(range(1, 8)), format_func=lambda d: DAY_LABELS[d-1],
+            key=f"ua_copy_from_{w}", label_visibility="collapsed"
+        )
+        copy_to = cto.selectbox(
+            "To day", options=list(range(1, 8)), format_func=lambda d: DAY_LABELS[d-1],
+            key=f"ua_copy_to_{w}", label_visibility="collapsed"
+        )
+        if cbtn.button("Copy", key=f"ua_copy_btn_{w}"):
+            if copy_from == copy_to:
+                st.warning("Pick two different days to copy between.")
+            else:
+                # Copy both the full-day-off flag and the time ranges from day A to day B
+                if copy_from in u["days"]:
+                    u["days"].add(copy_to)
+                else:
+                    u["days"].discard(copy_to)
+                if copy_from in u["ranges"]:
+                    u["ranges"][copy_to] = list(u["ranges"][copy_from])
+                elif copy_to in u["ranges"]:
+                    del u["ranges"][copy_to]
+                _save_unavailability()
+                st.success(f"Copied {DAY_LABELS[copy_from-1]}'s restrictions to {DAY_LABELS[copy_to-1]}.")
+                st.rerun()
+
+        if st.button("Clear all restrictions for this worker", key=f"ua_clear_{w}"):
+            st.session_state["unavailability"][w] = {"days": set(), "ranges": {}}
+            _save_unavailability()
+            st.rerun()
+
+        st.caption("💾 Unavailability is saved automatically and will still be here next time you open the app.")
 
 
     # ------- Priority Slots --------
@@ -547,7 +641,7 @@ with st.sidebar:
     st.session_state["priority_slots"].setdefault(loc_select, set())
 
     st.markdown("##### Priority Time Slots")
-    for d in range(1,8): # Only show 1 week in the UI instead of all 28 days (D)
+    for d in range(1,8): # Only show 1 week in the UI instead of all days in D
         with st.expander(DAY_LABELS[d - 1]):
             cur = sorted({ # current selections for a given weekday across all weeks
                 t for (dd, t) in st.session_state["priority_slots"][loc_select] 
@@ -575,11 +669,11 @@ with st.sidebar:
                 if ((dd - 1) % 7) + 1 != d
             }
 
-            # Add selected slots directly for all 4 weeks
+            # Add selected slots directly for all weeks in the horizon
             st.session_state["priority_slots"][loc_select].update(
                 {
                     (d + 7 * week, t)
-                    for week in range(4)
+                    for week in range(num_weeks)
                     for t in sel
                 }
             )
@@ -609,27 +703,27 @@ if demand_file:
         # Convert to 7 days x 18 time slots
         one_week = core.T.reset_index(drop=True)
 
-        # Repeat to 28 days (4 weeks)
-        four_weeks = pd.concat([one_week] * 4, ignore_index=True)
+        # Repeat weekly template to the full scheduling horizon
+        all_weeks = pd.concat([one_week] * num_weeks, ignore_index=True)
 
-        demand[loc] = four_weeks
-        expected_shapes[loc] = (one_week.shape[0] * 4, one_week.shape[1]) # days, time slots
+        demand[loc] = all_weeks
+        expected_shapes[loc] = (one_week.shape[0] * num_weeks, one_week.shape[1]) # days, time slots
         
         # Validate shape of input file for each location
         if df.empty: # if demand sheet is missing
             st.error(f"{loc}: Demand sheet is empty.")
             st.stop()
         
-        if four_weeks.shape != expected_shapes[loc]:
+        if all_weeks.shape != expected_shapes[loc]:
             expected_rows, expected_cols = expected_shapes[loc]
             st.error(
                 f"Demand for {loc} must resolve to {expected_cols} time slots x {expected_rows} days. "
-                f"Got: {four_weeks.shape}"
+                f"Got: {all_weeks.shape}"
             )
             st.stop()
 
 else:
-    demand = {"DEFAULT": pd.DataFrame(np.zeros((28, 18), dtype=float))}
+    demand = {"DEFAULT": pd.DataFrame(np.zeros((num_days, 18), dtype=float))}
 
 
 # ------------------ Solve ------------------ 
@@ -659,16 +753,23 @@ if solve_clicked:
     # Start running the solve job, runs outside of Streamlit UI and set to the disk
         # Note: Taking deepcopy of the UI sidebar's inputs/selections in case they get
         # adjusted after the "Solve" button is clicked.
+        # "unavailability" is stored as {"days": ..., "ranges": ...} for the UI; the
+        # optimizer itself expects {"days": ..., "slots": ...}, so derive "slots" here.
+    unavailability_payload = {
+        w: {"days": set(u.get("days", set())), "slots": ranges_to_slots(u.get("ranges", {}))}
+        for w, u in st.session_state["unavailability"].items()
+    }
     start_solve_job(
         adapt_to_user_optimizer, # job_fn
         copy.deepcopy(st.session_state["demand_df"]), # demand_df
         copy.deepcopy(st.session_state["staff_df"]), # staff_df
         float(max_dev), # max_dev
-        copy.deepcopy(st.session_state["unavailability"]), # unavailability
+        copy.deepcopy(unavailability_payload), # unavailability
         copy.deepcopy(st.session_state["priority_slots"]), # priority_slots
         int(M_choice), # M_choice
         int(N_choice), # N_choice
         copy.deepcopy(constraints_flag), # constraints_flag
+        int(num_weeks), # num_weeks
     )
     st.success("The optimizer has started solving in the background. It'll keep running "
                "even if you close this tab - come back anytime and click 'Check Results'.")
@@ -691,6 +792,9 @@ if check_clicked:
         if err_res:
             for e in err_res.get("errors", []):
                 st.caption(e)
+            if err_res.get("traceback"):
+                with st.expander("Full error details (traceback)"):
+                    st.code(err_res["traceback"], language="python")
     elif status == "done":
         res = get_solve_result()
 
@@ -761,7 +865,7 @@ if check_clicked:
 
             ### Per Worker Schedule
             # Display table
-            st.write("#### Per-Worker Schedule (hourly over 4 weeks)")
+            st.write(f"#### Per-Worker Schedule (hourly over {num_weeks} weeks)")
 
             assignments_df = res.get("assignments_df", pd.DataFrame(columns=["name","day","start_slot","end_slot"]))
 
@@ -770,7 +874,7 @@ if check_clicked:
                 st.write("No assignments have been made.")
             else:
                 for w in assignments_df["name"].astype(str).unique().tolist():
-                    mat = np.zeros((28, 18), dtype=int)
+                    mat = np.zeros((num_days, 18), dtype=int)
                     sub = assignments_df[assignments_df["name"] == w]
                     for _, r in sub.iterrows(): 
                         day = int(r["day"]) - 1
@@ -781,7 +885,7 @@ if check_clicked:
                     worker_df = pd.DataFrame(
                                     mat,
                                     columns=SLOT_LABELS,
-                                    index=DAY_LABELS_FULL
+                                    index=day_labels_full(num_weeks)
                                 )
 
                     # Display table
